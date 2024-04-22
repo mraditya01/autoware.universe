@@ -48,7 +48,8 @@ MapUpdateModule::MapUpdateModule(
 bool MapUpdateModule::should_update_map(const geometry_msgs::msg::Point & position)
 {
   if (last_update_position_ == std::nullopt) {
-    return false;
+    need_rebuild_ = true;
+    return true;
   }
 
   const double dx = position.x - last_update_position_.value().x;
@@ -77,6 +78,9 @@ void MapUpdateModule::update_map(const geometry_msgs::msg::Point & position)
     ndt_ptr_.reset(new NdtType);
 
     ndt_ptr_->setParams(param);
+    if (input_source != nullptr) {
+      ndt_ptr_->setInputSource(input_source);
+    }
 
     const bool updated = update_ndt(position, *ndt_ptr_);
     if (!updated) {
@@ -88,7 +92,6 @@ void MapUpdateModule::update_map(const geometry_msgs::msg::Point & position)
       ndt_ptr_mutex_->unlock();
       return;
     }
-    ndt_ptr_->setInputSource(input_source);
     ndt_ptr_mutex_->unlock();
     need_rebuild_ = false;
   } else {
@@ -107,7 +110,9 @@ void MapUpdateModule::update_map(const geometry_msgs::msg::Point & position)
     auto dummy_ptr = ndt_ptr_;
     auto input_source = ndt_ptr_->getInputSource();
     ndt_ptr_ = secondary_ndt_ptr_;
-    ndt_ptr_->setInputSource(input_source);
+    if (input_source != nullptr) {
+      ndt_ptr_->setInputSource(input_source);
+    }
     ndt_ptr_mutex_->unlock();
 
     dummy_ptr.reset();
