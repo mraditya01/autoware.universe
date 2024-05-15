@@ -66,8 +66,21 @@ bool isCentroidWithinLanelet(const PredictedObject & object, const lanelet::Cons
 
 bool isPolygonOverlapLanelet(const PredictedObject & object, const lanelet::ConstLanelet & lanelet)
 {
-  const auto object_polygon = tier4_autoware_utils::toPolygon2d(object);
   const auto lanelet_polygon = utils::toPolygon2d(lanelet);
+  return isPolygonOverlapLanelet(object, lanelet_polygon);
+}
+
+bool isPolygonOverlapLanelet(
+  const PredictedObject & object, const tier4_autoware_utils::Polygon2d & lanelet_polygon)
+{
+  const auto object_polygon = tier4_autoware_utils::toPolygon2d(object);
+  return !boost::geometry::disjoint(lanelet_polygon, object_polygon);
+}
+
+bool isPolygonOverlapLanelet(
+  const PredictedObject & object, const lanelet::BasicPolygon2d & lanelet_polygon)
+{
+  const auto object_polygon = tier4_autoware_utils::toPolygon2d(object);
   return !boost::geometry::disjoint(lanelet_polygon, object_polygon);
 }
 
@@ -289,13 +302,7 @@ ExtendedPredictedObject transform(
   const PredictedObject & object, const double safety_check_time_horizon,
   const double safety_check_time_resolution)
 {
-  ExtendedPredictedObject extended_object;
-  extended_object.uuid = object.object_id;
-  extended_object.initial_pose = object.kinematics.initial_pose_with_covariance;
-  extended_object.initial_twist = object.kinematics.initial_twist_with_covariance;
-  extended_object.initial_acceleration = object.kinematics.initial_acceleration_with_covariance;
-  extended_object.shape = object.shape;
-  extended_object.classification = object.classification;
+  ExtendedPredictedObject extended_object(object);
 
   const auto obj_velocity = extended_object.initial_twist.twist.linear.x;
 
@@ -347,11 +354,9 @@ TargetObjectsOnLane createTargetObjectsOnLane(
   };
 
   const auto update_left_shoulder_lanelet = [&](const lanelet::ConstLanelet & target_lane) {
-    lanelet::ConstLanelet neighbor_shoulder_lane{};
-    const bool shoulder_lane_is_found =
-      route_handler->getLeftShoulderLanelet(target_lane, &neighbor_shoulder_lane);
-    if (shoulder_lane_is_found) {
-      all_left_shoulder_lanelets.insert(all_left_shoulder_lanelets.end(), neighbor_shoulder_lane);
+    const auto neighbor_shoulder_lane = route_handler->getLeftShoulderLanelet(target_lane);
+    if (neighbor_shoulder_lane) {
+      all_left_shoulder_lanelets.insert(all_left_shoulder_lanelets.end(), *neighbor_shoulder_lane);
     }
   };
 

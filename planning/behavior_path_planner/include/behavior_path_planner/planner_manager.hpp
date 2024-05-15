@@ -96,7 +96,7 @@ struct SceneModuleStatus
 class PlannerManager
 {
 public:
-  PlannerManager(rclcpp::Node & node, const size_t max_iteration_num, const bool verbose);
+  PlannerManager(rclcpp::Node & node, const size_t max_iteration_num);
 
   /**
    * @brief run all candidate and approved modules.
@@ -290,8 +290,6 @@ private:
 
     module_ptr->updateCurrentState();
 
-    module_ptr->publishRTCStatus();
-
     module_ptr->publishSteeringFactor();
 
     module_ptr->publishObjectsOfInterestMarker();
@@ -323,7 +321,6 @@ private:
   void deleteExpiredModules(SceneModulePtr & module_ptr) const
   {
     module_ptr->onExit();
-    module_ptr->publishRTCStatus();
     module_ptr->publishObjectsOfInterestMarker();
     module_ptr.reset();
   }
@@ -471,8 +468,6 @@ private:
   mutable std::shared_ptr<SceneModuleVisitor> debug_msg_ptr_;
 
   size_t max_iteration_num_{100};
-
-  bool verbose_{false};
 };
 }  // namespace behavior_path_planner
 
