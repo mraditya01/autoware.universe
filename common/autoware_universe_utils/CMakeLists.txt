@@ -16,6 +16,8 @@ ament_auto_add_library(autoware_universe_utils SHARED
   src/geometry/boost_polygon_utils.cpp
   src/geometry/random_convex_polygon.cpp
   src/geometry/gjk_2d.cpp
+  src/geometry/facd_2d.cpp
+  src/geometry/random_non_convex_polygon.cpp
   src/math/sin_table.cpp
   src/math/trigonometry.cpp
   src/ros/msg_operation.cpp
