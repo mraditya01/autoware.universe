@@ -17,6 +17,7 @@
 #include "autoware/interpolation/linear_interpolation.hpp"
 #include "autoware/interpolation/spline_interpolation.hpp"
 #include "autoware/motion_utils/trajectory/trajectory.hpp"
+#include "autoware/trajectory/trajectory_point.hpp"
 #include "autoware_utils/geometry/geometry.hpp"
 #include "autoware_utils/math/normalization.hpp"
 
@@ -47,9 +48,104 @@ namespace MPCUtils
 using autoware_utils::calc_distance2d;
 using autoware_utils::create_quaternion_from_yaw;
 using autoware_utils::normalize_radian;
+using ContinuousTrajectory =
+  autoware::experimental::trajectory::Trajectory<autoware_planning_msgs::msg::TrajectoryPoint>;
+
+TrajectoryPoint toTrajectoryPoint(
+  const MPCTrajectory & input, const size_t idx, const double wheelbase = 0.0)
+{
+  TrajectoryPoint p;
+  p.pose.position.x = input.x.at(idx);
+  p.pose.position.y = input.y.at(idx);
+  p.pose.position.z = input.z.at(idx);
+  p.pose.orientation = create_quaternion_from_yaw(input.yaw.at(idx));
+  p.longitudinal_velocity_mps =
+    static_cast<decltype(p.longitudinal_velocity_mps)>(input.vx.at(idx));
+  if (!input.relative_time.empty()) {
+    p.time_from_start =
+      rclcpp::Duration::from_seconds(input.relative_time.at(idx) - input.relative_time.front());
+  }
+  if (wheelbase != 0.0 && idx < input.smooth_k.size()) {
+    p.front_wheel_angle_rad = static_cast<float>(std::atan(input.smooth_k.at(idx) * wheelbase));
+  }
+  return p;
+}
+
+std::vector<TrajectoryPoint> toTrajectoryPoints(
+  const MPCTrajectory & input, const double wheelbase = 0.0)
+{
+  std::vector<TrajectoryPoint> points;
+  points.reserve(input.size());
+  for (size_t i = 0; i < input.size(); ++i) {
+    points.push_back(toTrajectoryPoint(input, i, wheelbase));
+  }
+  return points;
+}
+
+auto buildContinuousTrajectory(const MPCTrajectory & input)
+{
+  return ContinuousTrajectory::Builder{}.build(toTrajectoryPoints(input));
+}
+
+std::vector<double> calcArcLength2d(const MPCTrajectory & trajectory)
+{
+  std::vector<double> arc_length;
+  if (trajectory.empty()) {
+    return arc_length;
+  }
+
+  double dist = 0.0;
+  arc_length.push_back(dist);
+  for (size_t i = 1; i < trajectory.size(); ++i) {
+    const double dx = trajectory.x.at(i) - trajectory.x.at(i - 1);
+    const double dy = trajectory.y.at(i) - trajectory.y.at(i - 1);
+    dist += std::hypot(dx, dy);
+    arc_length.push_back(dist);
+  }
+  return arc_length;
+}
+
+std::vector<double> calcArcLength3d(const MPCTrajectory & trajectory)
+{
+  std::vector<double> arc_length;
+  if (trajectory.empty()) {
+    return arc_length;
+  }
+
+  double dist = 0.0;
+  arc_length.push_back(dist);
+  for (size_t i = 1; i < trajectory.size(); ++i) {
+    const double dx = trajectory.x.at(i) - trajectory.x.at(i - 1);
+    const double dy = trajectory.y.at(i) - trajectory.y.at(i - 1);
+    const double dz = trajectory.z.at(i) - trajectory.z.at(i - 1);
+    dist += std::hypot(std::hypot(dx, dy), dz);
+    arc_length.push_back(dist);
+  }
+  return arc_length;
+}
+
+void pushContinuousPoint(
+  MPCTrajectory & output, const TrajectoryPoint & p, const double k, const double smooth_k,
+  const double relative_time)
+{
+  output.push_back(
+    p.pose.position.x, p.pose.position.y, p.pose.position.z, tf2::getYaw(p.pose.orientation),
+    p.longitudinal_velocity_mps, k, smooth_k, relative_time);
+}
 
 double calcDistance2d(const MPCTrajectory & trajectory, const size_t idx1, const size_t idx2)
 {
+  const auto arclength = calcArcLength2d(trajectory);
+  const auto continuous_trajectory = buildContinuousTrajectory(trajectory);
+  if (continuous_trajectory) {
+    const double trajectory_length = continuous_trajectory->length();
+    const auto p1 =
+      continuous_trajectory->compute(std::clamp(arclength.at(idx1), 0.0, trajectory_length));
+    const auto p2 =
+      continuous_trajectory->compute(std::clamp(arclength.at(idx2), 0.0, trajectory_length));
+    return calc_distance2d(p1, p2);
+  }
+
   const double dx = trajectory.x.at(idx1) - trajectory.x.at(idx2);
   const double dy = trajectory.y.at(idx1) - trajectory.y.at(idx2);
   return std::hypot(dx, dy);
@@ -57,6 +153,20 @@ double calcDistance2d(const MPCTrajectory & trajectory, const size_t idx1, const
 
 double calcDistance3d(const MPCTrajectory & trajectory, const size_t idx1, const size_t idx2)
 {
+  const auto arclength = calcArcLength2d(trajectory);
+  const auto continuous_trajectory = buildContinuousTrajectory(trajectory);
+  if (continuous_trajectory) {
+    const double trajectory_length = continuous_trajectory->length();
+    const auto p1 =
+      continuous_trajectory->compute(std::clamp(arclength.at(idx1), 0.0, trajectory_length));
+    const auto p2 =
+      continuous_trajectory->compute(std::clamp(arclength.at(idx2), 0.0, trajectory_length));
+    const double dx = p1.pose.position.x - p2.pose.position.x;
+    const double dy = p1.pose.position.y - p2.pose.position.y;
+    const double dz = p1.pose.position.z - p2.pose.position.z;
+    return std::hypot(std::hypot(dx, dy), dz);
+  }
+
   const double dx = trajectory.x.at(idx1) - trajectory.x.at(idx2);
   const double dy = trajectory.y.at(idx1) - trajectory.y.at(idx2);
   const double dz = trajectory.z.at(idx1) - trajectory.z.at(idx2);
@@ -82,22 +192,13 @@ double calcLateralError(const Pose & ego_pose, const Pose & ref_pose)
 
 void calcMPCTrajectoryArcLength(const MPCTrajectory & trajectory, std::vector<double> & arc_length)
 {
-  double dist = 0.0;
-  arc_length.clear();
-  arc_length.push_back(dist);
-  for (uint i = 1; i < trajectory.size(); ++i) {
-    dist += calcDistance2d(trajectory, i, i - 1);
-    arc_length.push_back(dist);
-  }
+  arc_length = calcArcLength2d(trajectory);
 }
 
 double calcMPCTrajectoryArcLength(const MPCTrajectory & trajectory)
 {
-  double length = 0.0;
-  for (size_t i = 1; i < trajectory.size(); ++i) {
-    length += calcDistance2d(trajectory, i, i - 1);
-  }
-  return length;
+  const auto arc_length = calcArcLength2d(trajectory);
+  return arc_length.empty() ? 0.0 : arc_length.back();
 }
 
 std::pair<bool, MPCTrajectory> resampleMPCTrajectoryByDistance(
@@ -109,31 +210,42 @@ std::pair<bool, MPCTrajectory> resampleMPCTrajectoryByDistance(
   if (input.empty()) {
     return {true, output};
   }
+  if (resample_interval_dist <= std::numeric_limits<double>::epsilon()) {
+    return {false, output};
+  }
+
   std::vector<double> input_arclength;
   calcMPCTrajectoryArcLength(input, input_arclength);
 
-  if (input_arclength.empty()) {
+  if (input_arclength.empty() || nearest_seg_idx >= input_arclength.size()) {
+    return {false, output};
+  }
+
+  const auto continuous_trajectory = buildContinuousTrajectory(input);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    return {false, output};
+  }
+
+  const double trajectory_length = continuous_trajectory->length();
+  if (trajectory_length <= std::numeric_limits<double>::epsilon()) {
     return {false, output};
   }
 
   std::vector<double> output_arclength;
   // To accurately sample the ego point, resample separately in the forward direction and the
   // backward direction from the current position.
-  for (double s = std::clamp(
-         input_arclength.at(nearest_seg_idx) + ego_offset_to_segment, 0.0,
-         input_arclength.back() - 1e-6);
-       0 <= s; s -= resample_interval_dist) {
+  const double origin_s = input_arclength.at(nearest_seg_idx) + ego_offset_to_segment;
+  for (double s = std::clamp(origin_s, 0.0, trajectory_length - 1e-6); 0 <= s;
+       s -= resample_interval_dist) {
     output_arclength.push_back(s);
   }
   std::reverse(output_arclength.begin(), output_arclength.end());
-  for (double s = std::max(input_arclength.at(nearest_seg_idx) + ego_offset_to_segment, 0.0) +
-                  resample_interval_dist;
-       s < input_arclength.back(); s += resample_interval_dist) {
+  for (double s = std::max(origin_s, 0.0) + resample_interval_dist; s < trajectory_length;
+       s += resample_interval_dist) {
     output_arclength.push_back(s);
   }
-
-  std::vector<double> input_yaw = input.yaw;
-  convertEulerAngleToMonotonic(input_yaw);
 
   const auto lerp_arc_length = [&](const auto & input_value) {
     return autoware::interpolation::lerp(input_arclength, input_value, output_arclength);
@@ -142,14 +254,15 @@ std::pair<bool, MPCTrajectory> resampleMPCTrajectoryByDistance(
     return autoware::interpolation::spline(input_arclength, input_value, output_arclength);
   };
 
-  output.x = spline_arc_length(input.x);
-  output.y = spline_arc_length(input.y);
-  output.z = spline_arc_length(input.z);
-  output.yaw = spline_arc_length(input_yaw);
-  output.vx = lerp_arc_length(input.vx);  // must be linear
-  output.k = spline_arc_length(input.k);
-  output.smooth_k = spline_arc_length(input.smooth_k);
-  output.relative_time = lerp_arc_length(input.relative_time);  // must be linear
+  const auto output_k = spline_arc_length(input.k);
+  const auto output_smooth_k = spline_arc_length(input.smooth_k);
+  const auto output_relative_time = lerp_arc_length(input.relative_time);  // must be linear
+
+  for (size_t i = 0; i < output_arclength.size(); ++i) {
+    pushContinuousPoint(
+      output, continuous_trajectory->compute(output_arclength.at(i)), output_k.at(i),
+      output_smooth_k.at(i), output_relative_time.at(i));
+  }
 
   return {true, output};
 }
@@ -162,23 +275,33 @@ bool linearInterpMPCTrajectory(
     out_traj = in_traj;
     return true;
   }
-
-  std::vector<double> in_traj_yaw = in_traj.yaw;
-  convertEulerAngleToMonotonic(in_traj_yaw);
+  out_traj.clear();
 
   const auto lerp_arc_length = [&](const auto & input_value) {
     return autoware::interpolation::lerp(in_index, input_value, out_index);
   };
 
   try {
-    out_traj.x = lerp_arc_length(in_traj.x);
-    out_traj.y = lerp_arc_length(in_traj.y);
-    out_traj.z = lerp_arc_length(in_traj.z);
-    out_traj.yaw = lerp_arc_length(in_traj_yaw);
-    out_traj.vx = lerp_arc_length(in_traj.vx);
-    out_traj.k = lerp_arc_length(in_traj.k);
-    out_traj.smooth_k = lerp_arc_length(in_traj.smooth_k);
-    out_traj.relative_time = lerp_arc_length(in_traj.relative_time);
+    const auto output_k = lerp_arc_length(in_traj.k);
+    const auto output_smooth_k = lerp_arc_length(in_traj.smooth_k);
+    const auto output_relative_time = lerp_arc_length(in_traj.relative_time);
+
+    const auto input_arclength = calcArcLength2d(in_traj);
+    const auto output_arclength =
+      autoware::interpolation::lerp(in_index, input_arclength, out_index);
+    const auto continuous_trajectory = buildContinuousTrajectory(in_traj);
+    if (!continuous_trajectory) {
+      std::cerr << "[mpc util] failed to build continuous trajectory: "
+                << continuous_trajectory.error().what << std::endl;
+      return false;
+    }
+    const double trajectory_length = continuous_trajectory->length();
+    for (size_t i = 0; i < output_arclength.size(); ++i) {
+      const double s = std::clamp(output_arclength.at(i), 0.0, trajectory_length);
+      pushContinuousPoint(
+        out_traj, continuous_trajectory->compute(s), output_k.at(i), output_smooth_k.at(i),
+        output_relative_time.at(i));
+    }
   } catch (const std::exception & e) {
     std::cerr << "linearInterpMPCTrajectory error!: " << e.what() << std::endl;
   }
@@ -201,15 +324,17 @@ void calcTrajectoryYawFromXY(MPCTrajectory & traj, const bool is_forward_shift)
     return;
   }
 
-  // interpolate yaw
-  for (int i = 1; i < static_cast<int>(traj.yaw.size()) - 1; ++i) {
-    const double dx = traj.x.at(i + 1) - traj.x.at(i - 1);
-    const double dy = traj.y.at(i + 1) - traj.y.at(i - 1);
-    traj.yaw.at(i) = is_forward_shift ? std::atan2(dy, dx) : std::atan2(dy, dx) + M_PI;
+  auto continuous_trajectory = buildContinuousTrajectory(traj);
+  if (!continuous_trajectory) {
+    RCLCPP_ERROR(rclcpp::get_logger("mpc_utils"), "failed to build continuous trajectory.");
+    return;
   }
-  if (traj.yaw.size() > 1) {
-    traj.yaw.at(0) = traj.yaw.at(1);
-    traj.yaw.back() = traj.yaw.at(traj.yaw.size() - 2);
+
+  continuous_trajectory->align_orientation_with_trajectory_direction();
+  const auto arclength = calcArcLength2d(traj);
+  for (size_t i = 0; i < traj.yaw.size(); ++i) {
+    const auto yaw = tf2::getYaw(continuous_trajectory->compute(arclength.at(i)).pose.orientation);
+    traj.yaw.at(i) = is_forward_shift ? yaw : yaw + M_PI;
   }
 }
 
@@ -226,6 +351,18 @@ std::vector<double> calcTrajectoryCurvature(
 {
   std::vector<double> curvature_vec(traj.x.size());
 
+  if (traj.size() < 3) {
+    return curvature_vec;
+  }
+
+  const auto arclength = calcArcLength2d(traj);
+  const auto continuous_trajectory = buildContinuousTrajectory(traj);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    return curvature_vec;
+  }
+
   /* calculate curvature by circle fitting from three points */
   geometry_msgs::msg::Point p1, p2, p3;
   const int max_smoothing_num =
@@ -235,12 +372,13 @@ std::vector<double> calcTrajectoryCurvature(
     const size_t curr_idx = i;
     const size_t prev_idx = curr_idx - L;
     const size_t next_idx = curr_idx + L;
-    p1.x = traj.x.at(prev_idx);
-    p2.x = traj.x.at(curr_idx);
-    p3.x = traj.x.at(next_idx);
-    p1.y = traj.y.at(prev_idx);
-    p2.y = traj.y.at(curr_idx);
-    p3.y = traj.y.at(next_idx);
+    const double trajectory_length = continuous_trajectory->length();
+    p1 = continuous_trajectory->compute(std::clamp(arclength.at(prev_idx), 0.0, trajectory_length))
+           .pose.position;
+    p2 = continuous_trajectory->compute(std::clamp(arclength.at(curr_idx), 0.0, trajectory_length))
+           .pose.position;
+    p3 = continuous_trajectory->compute(std::clamp(arclength.at(next_idx), 0.0, trajectory_length))
+           .pose.position;
     try {
       curvature_vec.at(curr_idx) = autoware_utils::calc_curvature(p1, p2, p3);
     } catch (...) {
@@ -261,7 +399,12 @@ std::vector<double> calcTrajectoryCurvature(
 MPCTrajectory convertToMPCTrajectory(const Trajectory & input)
 {
   MPCTrajectory output;
-  for (const TrajectoryPoint & p : input.points) {
+
+  if (input.points.empty()) {
+    return output;
+  }
+
+  const auto push_back_point = [&](const TrajectoryPoint & p) {
     const double x = p.pose.position.x;
     const double y = p.pose.position.y;
     const double z = p.pose.position.z;
@@ -270,7 +413,40 @@ MPCTrajectory convertToMPCTrajectory(const Trajectory & input)
     const double k = 0.0;
     const double t = 0.0;
     output.push_back(x, y, z, yaw, vx, k, k, t);
+  };
+
+  if (input.points.size() < 2) {
+    for (const TrajectoryPoint & p : input.points) {
+      push_back_point(p);
+    }
+    calcMPCTrajectoryTime(output);
+    return output;
   }
+
+  const auto continuous_trajectory = ContinuousTrajectory::Builder{}.build(input.points);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    for (const TrajectoryPoint & p : input.points) {
+      push_back_point(p);
+    }
+    calcMPCTrajectoryTime(output);
+    return output;
+  }
+
+  std::vector<double> input_arclength;
+  input_arclength.reserve(input.points.size());
+  input_arclength.push_back(0.0);
+  for (size_t i = 1; i < input.points.size(); ++i) {
+    input_arclength.push_back(
+      input_arclength.back() + calc_distance2d(input.points.at(i - 1), input.points.at(i)));
+  }
+
+  const double trajectory_length = continuous_trajectory->length();
+  for (const auto s : input_arclength) {
+    push_back_point(continuous_trajectory->compute(std::clamp(s, 0.0, trajectory_length)));
+  }
+
   calcMPCTrajectoryTime(output);
   return output;
 }
@@ -278,17 +454,27 @@ MPCTrajectory convertToMPCTrajectory(const Trajectory & input)
 Trajectory convertToAutowareTrajectory(const MPCTrajectory & input, const double wheelbase)
 {
   Trajectory output;
-  TrajectoryPoint p;
+  if (input.empty()) {
+    return output;
+  }
+
+  const auto continuous_trajectory = buildContinuousTrajectory(input);
+  const auto arclength = calcArcLength2d(input);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    output.points = toTrajectoryPoints(input, wheelbase);
+    return output;
+  }
+
   for (size_t i = 0; i < input.size(); ++i) {
-    p.pose.position.x = input.x.at(i);
-    p.pose.position.y = input.y.at(i);
-    p.pose.position.z = input.z.at(i);
-    p.pose.orientation = autoware_utils::create_quaternion_from_yaw(input.yaw.at(i));
-    p.longitudinal_velocity_mps =
-      static_cast<decltype(p.longitudinal_velocity_mps)>(input.vx.at(i));
-    p.time_from_start =
-      rclcpp::Duration::from_seconds(input.relative_time.at(i) - input.relative_time.front());
-    if (wheelbase != 0.0) {
+    auto p = continuous_trajectory->compute(
+      std::clamp(arclength.at(i), 0.0, continuous_trajectory->length()));
+    if (!input.relative_time.empty()) {
+      p.time_from_start =
+        rclcpp::Duration::from_seconds(input.relative_time.at(i) - input.relative_time.front());
+    }
+    if (wheelbase != 0.0 && i < input.smooth_k.size()) {
       p.front_wheel_angle_rad = static_cast<float>(std::atan(input.smooth_k.at(i) * wheelbase));
     }
     output.points.push_back(p);
@@ -301,15 +487,18 @@ Trajectory convertToAutowareTrajectory(const MPCTrajectory & input, const double
 
 bool calcMPCTrajectoryTime(MPCTrajectory & traj)
 {
+  if (traj.empty()) {
+    return true;
+  }
+
   constexpr auto min_dt = 1.0e-4;  // must be positive value to avoid duplication in time
-  double t = 0.0;
+  const auto arclength = calcArcLength3d(traj);
   traj.relative_time.clear();
-  traj.relative_time.push_back(t);
+  traj.relative_time.push_back(0.0);
   for (size_t i = 0; i < traj.x.size() - 1; ++i) {
-    const double dist = calcDistance3d(traj, i, i + 1);
+    const double dist = arclength.at(i + 1) - arclength.at(i);
     const double v = std::max(std::fabs(traj.vx.at(i)), 0.1);
-    t += std::max(dist / v, min_dt);
-    traj.relative_time.push_back(t);
+    traj.relative_time.push_back(traj.relative_time.back() + std::max(dist / v, min_dt));
   }
   return true;
 }
@@ -318,6 +507,7 @@ void dynamicSmoothingVelocity(
   const size_t start_seg_idx, const double start_vel, const double acc_lim, const double tau,
   MPCTrajectory & traj)
 {
+  const auto arclength = calcArcLength2d(traj);
   double curr_v = start_vel;
   // set current velocity in both start and end point of the segment
   traj.vx.at(start_seg_idx) = start_vel;
@@ -326,7 +516,7 @@ void dynamicSmoothingVelocity(
   }
 
   for (size_t i = start_seg_idx + 2; i < traj.size(); ++i) {
-    const double ds = calcDistance2d(traj, i, i - 1);
+    const double ds = arclength.at(i) - arclength.at(i - 1);
     const double dt = ds / std::max(std::fabs(curr_v), std::numeric_limits<double>::epsilon());
     const double a = tau / std::max(tau + dt, std::numeric_limits<double>::epsilon());
     const double updated_v = a * curr_v + (1.0 - a) * traj.vx.at(i);
@@ -356,11 +546,19 @@ bool calcNearestPoseInterp(
   *nearest_index = autoware::motion_utils::findFirstNearestIndexWithSoftConstraints(
     autoware_traj.points, self_pose, max_dist, max_yaw);
   const size_t traj_size = traj.size();
+  const auto arclength = calcArcLength2d(traj);
+  const auto continuous_trajectory = buildContinuousTrajectory(traj);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    return false;
+  }
 
   if (traj.size() == 1) {
-    nearest_pose->position.x = traj.x.at(*nearest_index);
-    nearest_pose->position.y = traj.y.at(*nearest_index);
-    nearest_pose->orientation = create_quaternion_from_yaw(traj.yaw.at(*nearest_index));
+    *nearest_pose =
+      continuous_trajectory
+        ->compute(std::clamp(arclength.at(*nearest_index), 0.0, continuous_trajectory->length()))
+        .pose;
     *nearest_time = traj.relative_time.at(*nearest_index);
     return true;
   }
@@ -398,9 +596,10 @@ bool calcNearestPoseInterp(
   const double traj_seg_length = autoware_utils::calc_distance2d(prev_traj_point, next_traj_point);
   /* if distance between two points are too close */
   if (traj_seg_length < 1.0E-5) {
-    nearest_pose->position.x = traj.x.at(*nearest_index);
-    nearest_pose->position.y = traj.y.at(*nearest_index);
-    nearest_pose->orientation = create_quaternion_from_yaw(traj.yaw.at(*nearest_index));
+    *nearest_pose =
+      continuous_trajectory
+        ->compute(std::clamp(arclength.at(*nearest_index), 0.0, continuous_trajectory->length()))
+        .pose;
     *nearest_time = traj.relative_time.at(*nearest_index);
     return true;
   }
@@ -409,11 +608,10 @@ bool calcNearestPoseInterp(
   const double ratio = std::clamp(
     calcLongitudinalOffset(prev_traj_point, next_traj_point, self_pose.position) / traj_seg_length,
     0.0, 1.0);
-  nearest_pose->position.x = (1 - ratio) * traj.x.at(prev) + ratio * traj.x.at(next);
-  nearest_pose->position.y = (1 - ratio) * traj.y.at(prev) + ratio * traj.y.at(next);
-  const double tmp_yaw_err = normalize_radian(traj.yaw.at(prev) - traj.yaw.at(next));
-  const double nearest_yaw = normalize_radian(traj.yaw.at(next) + (1 - ratio) * tmp_yaw_err);
-  nearest_pose->orientation = create_quaternion_from_yaw(nearest_yaw);
+  const double nearest_s = (1 - ratio) * arclength.at(prev) + ratio * arclength.at(next);
+  *nearest_pose =
+    continuous_trajectory->compute(std::clamp(nearest_s, 0.0, continuous_trajectory->length()))
+      .pose;
   *nearest_time = (1 - ratio) * traj.relative_time.at(prev) + ratio * traj.relative_time.at(next);
   return true;
 }
@@ -459,8 +657,13 @@ void extendTrajectoryInYawDirection(
   traj.yaw.back() = yaw;
 
   // get terminal pose
-  const auto autoware_traj = MPCUtils::convertToAutowareTrajectory(traj);
-  auto extended_pose = autoware_traj.points.back().pose;
+  const auto continuous_trajectory = buildContinuousTrajectory(traj);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    return;
+  }
+  auto extended_pose = continuous_trajectory->compute(continuous_trajectory->length()).pose;
 
   constexpr double extend_dist = 10.0;
   const double extend_vel = traj.vx.back();
@@ -480,15 +683,29 @@ void extendTrajectoryInYawDirection(
 MPCTrajectory clipTrajectoryByLength(const MPCTrajectory & trajectory, const double length)
 {
   MPCTrajectory clipped_trajectory;
-  clipped_trajectory.push_back(trajectory.at(0));
+  if (trajectory.empty()) {
+    return clipped_trajectory;
+  }
 
-  double current_length = 0.0;
+  const auto continuous_trajectory = buildContinuousTrajectory(trajectory);
+  if (!continuous_trajectory) {
+    std::cerr << "[mpc util] failed to build continuous trajectory: "
+              << continuous_trajectory.error().what << std::endl;
+    return clipped_trajectory;
+  }
+
+  const auto arclength = calcArcLength2d(trajectory);
+  pushContinuousPoint(
+    clipped_trajectory, continuous_trajectory->compute(arclength.front()), trajectory.k.front(),
+    trajectory.smooth_k.front(), trajectory.relative_time.front());
+
   for (size_t i = 1; i < trajectory.size(); ++i) {
-    current_length += calcDistance3d(trajectory, i, i - 1);
-    if (current_length > length) {
+    if (arclength.at(i) > length) {
       break;
     }
-    clipped_trajectory.push_back(trajectory.at(i));
+    pushContinuousPoint(
+      clipped_trajectory, continuous_trajectory->compute(arclength.at(i)), trajectory.k.at(i),
+      trajectory.smooth_k.at(i), trajectory.relative_time.at(i));
   }
 
   return clipped_trajectory;
